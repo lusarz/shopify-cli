@@ -1,4 +1,11 @@
-import {reportAnalyticsEvent, recordTiming, recordError, recordRetry, recordEvent} from './analytics.js'
+import {
+  reportAnalyticsEvent,
+  sendAnalyticsEventFromFile,
+  recordTiming,
+  recordError,
+  recordRetry,
+  recordEvent,
+} from './analytics.js'
 import * as os from './os.js'
 import {
   analyticsDisabled,
@@ -15,13 +22,15 @@ import {publishMonorailEvent} from './monorail.js'
 import {mockAndCaptureOutput} from './testing/output.js'
 import {addPublicMetadata, addSensitiveMetadata} from './metadata.js'
 import {sendErrorToBugsnag} from './error-handler.js'
-import {hashString} from './crypto.js'
+import {hashString, randomUUID} from './crypto.js'
+import {exec} from './system.js'
 import * as store from '../../private/node/analytics/storage.js'
 import {startAnalytics} from '../../private/node/analytics.js'
 import {CLI_KIT_VERSION} from '../common/version.js'
 import {setLastSeenAuthMethod, setLastSeenUserIdAfterAuth} from '../../private/node/session.js'
-
 import {test, expect, describe, vi, beforeEach, afterEach, MockedFunction} from 'vitest'
+import {stat} from 'node:fs/promises'
+import {randomUUID as nodeRandomUUID} from 'node:crypto'
 
 vi.mock('./context/local.js')
 vi.mock('./os.js')
@@ -32,6 +41,7 @@ vi.mock('../../version.js')
 vi.mock('./monorail.js')
 vi.mock('./cli.js')
 vi.mock('./error-handler.js')
+vi.mock('./system.js')
 
 function restoreEnvVariable(key: string, value: string | undefined): void {
   if (value === undefined) {
@@ -44,6 +54,7 @@ function restoreEnvVariable(key: string, value: string | undefined): void {
 describe('event tracking', () => {
   const currentDate = new Date(Date.UTC(2022, 1, 1, 10, 0, 0))
   let publishEventMock: MockedFunction<typeof publishMonorailEvent>
+  let execMock: MockedFunction<typeof exec>
 
   beforeEach(() => {
     vi.setSystemTime(currentDate)
@@ -53,10 +64,12 @@ describe('event tracking', () => {
     vi.mocked(ciPlatform).mockReturnValue({isCI: true, name: 'vitest', metadata: {}})
     vi.mocked(macAddress).mockResolvedValue('macAddress')
     vi.mocked(hashString).mockReturnValue('hashed-macaddress')
+    vi.mocked(randomUUID).mockImplementation(nodeRandomUUID)
     vi.mocked(isUnitTest).mockReturnValue(true)
     vi.mocked(cloudEnvironment).mockReturnValue({platform: 'localhost', editor: false})
     vi.mocked(os.platformAndArch).mockReturnValue({platform: 'darwin', arch: 'arm64'})
     publishEventMock = vi.mocked(publishMonorailEvent).mockReturnValue(Promise.resolve({type: 'ok'}))
+    execMock = vi.mocked(exec).mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -71,6 +84,92 @@ describe('event tracking', () => {
       await execute(['--path', tmpDir])
     })
   }
+
+  async function sendReportedAnalyticsPayload(): Promise<void> {
+    expect(execMock).toHaveBeenCalledOnce()
+    const execArgs = execMock.mock.calls[0]![1]
+    expect(execArgs.slice(1, 3)).toEqual(['send-analytics', '--payload-file'])
+
+    const payloadFile = execArgs[3]
+    if (!payloadFile) {
+      throw new Error('Expected send-analytics to receive a payload file')
+    }
+
+    await sendAnalyticsEventFromFile(payloadFile)
+  }
+
+  test('waits for the analytics process on Windows', async () => {
+    await inProjectWithFile('package.json', async (args) => {
+      // Given
+      const commandContent = {command: 'info', topic: 'app'}
+      await startAnalytics({commandContent, args, currentTime: currentDate.getTime() - 100})
+      vi.mocked(os.platformAndArch).mockReturnValue({platform: 'windows', arch: 'arm64'})
+
+      let resolveAnalyticsProcess: () => void = () => {}
+      const analyticsProcess = new Promise<void>((resolve) => {
+        resolveAnalyticsProcess = resolve
+      })
+      execMock.mockReturnValueOnce(analyticsProcess)
+
+      const config = {
+        runHook: vi.fn().mockResolvedValue({successes: [], failures: []}),
+        plugins: [],
+      } as any
+
+      // When
+      let reportCompleted = false
+      const report = reportAnalyticsEvent({config, exitMode: 'expected_error'}).then(() => {
+        reportCompleted = true
+      })
+      await vi.waitFor(() => expect(execMock).toHaveBeenCalledOnce())
+
+      // Then
+      expect(reportCompleted).toBe(false)
+      expect(execMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({background: false}),
+      )
+      resolveAnalyticsProcess()
+      await report
+      expect(reportCompleted).toBe(true)
+      await sendReportedAnalyticsPayload()
+    })
+  })
+
+  test('does not wait for the analytics process on non-Windows platforms', async () => {
+    await inProjectWithFile('package.json', async (args) => {
+      // Given
+      const commandContent = {command: 'info', topic: 'app'}
+      await startAnalytics({commandContent, args, currentTime: currentDate.getTime() - 100})
+
+      let resolveAnalyticsProcess: () => void = () => {}
+      const analyticsProcess = new Promise<void>((resolve) => {
+        resolveAnalyticsProcess = resolve
+      })
+      execMock.mockReturnValueOnce(analyticsProcess)
+
+      const config = {
+        runHook: vi.fn().mockResolvedValue({successes: [], failures: []}),
+        plugins: [],
+      } as any
+
+      // When
+      await reportAnalyticsEvent({config, exitMode: 'expected_error'})
+
+      // Then
+      expect(execMock).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({background: true}),
+      )
+      const payloadFile = execMock.mock.calls[0]![1][3]!
+      expect(payloadFile).toMatch(/shopify-cli-analytics-[\da-f-]+\.json$/u)
+      expect((await stat(payloadFile)).mode & 0o777).toBe(0o600)
+      resolveAnalyticsProcess()
+      await sendAnalyticsEventFromFile(payloadFile)
+    })
+  })
 
   test('sends the expected data to Monorail with cached app info', async () => {
     await inProjectWithFile('package.json', async (args) => {
@@ -95,6 +194,7 @@ describe('event tracking', () => {
         plugins: pluginsMap,
       } as any
       await reportAnalyticsEvent({config, exitMode: 'ok'})
+      await sendReportedAnalyticsPayload()
       // Then
       const version = CLI_KIT_VERSION
       const expectedPayloadPublic = {
@@ -155,6 +255,7 @@ describe('event tracking', () => {
         plugins: [],
       } as any
       await reportAnalyticsEvent({config, exitMode: 'ok'})
+      await sendReportedAnalyticsPayload()
 
       // Then
       expect(publishEventMock).toHaveBeenCalledOnce()
@@ -179,6 +280,7 @@ describe('event tracking', () => {
         plugins: [],
       } as any
       await reportAnalyticsEvent({config, errorMessage: 'Permission denied', exitMode: 'unexpected_error'})
+      await sendReportedAnalyticsPayload()
 
       // Then
       const version = CLI_KIT_VERSION
@@ -219,6 +321,7 @@ describe('event tracking', () => {
         plugins: [],
       } as any
       await reportAnalyticsEvent({config, exitMode: 'ok'})
+      await sendReportedAnalyticsPayload()
 
       // Then
       const expectedPayloadSensitive = {
@@ -243,6 +346,7 @@ describe('event tracking', () => {
         plugins: [],
       } as any
       await reportAnalyticsEvent({config, exitMode: 'ok'})
+      await sendReportedAnalyticsPayload()
 
       expect(publishEventMock).toHaveBeenCalledOnce()
       expect(publishEventMock.mock.calls[0]![2]).toMatchObject({
@@ -272,6 +376,7 @@ describe('event tracking', () => {
           plugins: [],
         } as any
         await reportAnalyticsEvent({config, exitMode: 'ok'})
+        await sendReportedAnalyticsPayload()
 
         // Then
         const sensitivePayload = publishEventMock.mock.calls[0]![2]

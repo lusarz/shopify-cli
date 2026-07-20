@@ -36,6 +36,58 @@ interface ReportAnalyticsEventOptions {
   exitMode: CommandExitMode
 }
 
+export async function sendAnalyticsEventFromFile(payloadFile: string): Promise<void> {
+  const {readFile, removeFile} = await import('./fs.js')
+  try {
+    const payloadStr = await readFile(payloadFile)
+    const payload = JSON.parse(payloadStr)
+
+    const doMonorail = async () => {
+      if (payload.skipMonorailAnalytics) return
+      const response = await publishMonorailEvent(MONORAIL_COMMAND_TOPIC, payload.public, payload.sensitive)
+      if (response.type === 'error') {
+        outputDebug(response.message)
+      }
+    }
+
+    const doOpenTelemetry = async () => {
+      if (payload.skipMetricAnalytics) return
+
+      const active = payload.public.cmd_all_timing_active_ms ?? 0
+      const network = payload.public.cmd_all_timing_network_ms ?? 0
+      const prompt = payload.public.cmd_all_timing_prompts_ms ?? 0
+
+      return recordMetrics(
+        {
+          skipMetricAnalytics: payload.skipMetricAnalytics,
+          cliVersion: payload.public.cli_version,
+          owningPlugin: payload.public.cmd_all_plugin ?? '@shopify/cli',
+          command: payload.public.command,
+          exitMode: payload.public.cmd_all_exit,
+        },
+        {
+          active,
+          network,
+          prompt,
+        },
+      )
+    }
+
+    await Promise.all([doMonorail(), doOpenTelemetry()])
+  } catch (error) {
+    if (error instanceof Error) {
+      outputDebug(`Failed to send analytics in background: ${error.message}`)
+    } else {
+      throw error
+    }
+  } finally {
+    await removeFile(payloadFile).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      outputDebug(`Failed to remove background analytics payload: ${message}`)
+    })
+  }
+}
+
 /**
  * Report an analytics event, sending it off to Monorail -- Shopify's internal analytics service.
  *
@@ -45,8 +97,7 @@ interface ReportAnalyticsEventOptions {
 export async function reportAnalyticsEvent(options: ReportAnalyticsEventOptions): Promise<void> {
   try {
     const payload = await buildPayload(options)
-    if (payload === undefined) {
-      // Nothing to log
+    if (payload === undefined || payload.public.command === 'send-analytics') {
       return
     }
 
@@ -65,40 +116,55 @@ export async function reportAnalyticsEvent(options: ReportAnalyticsEventOptions)
 
     const skipMonorailAnalytics = !alwaysLogAnalytics() && analyticsDisabled()
     const skipMetricAnalytics = !alwaysLogMetrics() && analyticsDisabled()
-    if (skipMonorailAnalytics || skipMetricAnalytics) {
+    if (skipMonorailAnalytics && skipMetricAnalytics) {
       outputDebug(outputContent`Skipping command analytics, payload: ${outputToken.json(payload)}`)
+      return
     }
 
-    const doMonorail = async () => {
-      if (skipMonorailAnalytics) {
-        return
-      }
-      const response = await publishMonorailEvent(MONORAIL_COMMAND_TOPIC, payload.public, payload.sensitive)
-      if (response.type === 'error') {
-        outputDebug(response.message)
-      }
-    }
-    const doOpenTelemetry = async () => {
-      const active = payload.public.cmd_all_timing_active_ms ?? 0
-      const network = payload.public.cmd_all_timing_network_ms ?? 0
-      const prompt = payload.public.cmd_all_timing_prompts_ms ?? 0
+    const {platformAndArch} = await import('./os.js')
+    const sendInBackground = platformAndArch().platform !== 'windows'
+    const deliveryDescription = sendInBackground ? ' in background' : ''
+    outputDebug(outputContent`Sending command analytics${deliveryDescription}, payload: ${outputToken.json(payload)}`)
 
-      return recordMetrics(
-        {
-          skipMetricAnalytics,
-          cliVersion: payload.public.cli_version,
-          owningPlugin: payload.public.cmd_all_plugin ?? '@shopify/cli',
-          command: payload.public.command,
-          exitMode: options.exitMode,
-        },
-        {
-          active,
-          network,
-          prompt,
-        },
-      )
+    const {joinPath} = await import('./path.js')
+    const {tmpdir} = await import('node:os')
+    const {removeFile, writeFile} = await import('./fs.js')
+    const {randomUUID} = await import('./crypto.js')
+
+    const payloadPath = joinPath(tmpdir(), `shopify-cli-analytics-${randomUUID()}.json`)
+
+    const fullPayload = {
+      ...payload,
+      skipMonorailAnalytics,
+      skipMetricAnalytics,
     }
-    await Promise.all([doMonorail(), doOpenTelemetry()])
+
+    await writeFile(payloadPath, JSON.stringify(fullPayload), {encoding: 'utf8', mode: 0o600, flag: 'wx'})
+
+    const {exec} = await import('./system.js')
+    const argv = process.argv
+    if (!argv[0] || !argv[1]) {
+      await removeFile(payloadPath)
+      return
+    }
+    const nodeBinary = argv[0]
+    const shopifyBinary = argv[1]
+    const args = [shopifyBinary, 'send-analytics', '--payload-file', payloadPath]
+
+    const analyticsProcess = exec(nodeBinary, args, {
+      background: sendInBackground,
+      env: {...process.env, SHOPIFY_CLI_NO_ANALYTICS: '1'},
+      externalErrorHandler: async (error: unknown) => {
+        await removeFile(payloadPath)
+        outputDebug(`Failed to send analytics in background: ${(error as Error).message}`)
+      },
+    })
+    if (sendInBackground) {
+      // eslint-disable-next-line no-void
+      void analyticsProcess
+    } else {
+      await analyticsProcess
+    }
 
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
