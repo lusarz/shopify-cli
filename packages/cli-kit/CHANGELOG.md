@@ -1,5 +1,12 @@
 # @shopify/cli-kit
 
+## 4.6.0
+
+### Patch Changes
+
+- 6c6cc2a: Allow app and theme commands to authenticate with a Shopify account alias without changing the current CLI session.
+- 77f8eca: Show a friendly error when theme creation is denied by missing theme write access
+
 ## 4.5.0
 
 ## 4.4.0
