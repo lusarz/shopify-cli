@@ -16,6 +16,7 @@ test.describe('App scaffold', () => {
     const appName = e2eAppName('scaffold')
     let appUrl: string | undefined
 
+    console.log(parentDir, appName)
     try {
       // Step 1: Create a new app from the react-router template
       const initResult = await createApp({

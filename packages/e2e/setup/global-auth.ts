@@ -58,6 +58,31 @@ export default async function globalSetup() {
     SHOPIFY_FLAG_CLIENT_ID: undefined,
   }
 
+  // Local-only escape hatch: reuse a session you authenticated by hand (see
+  // packages/e2e/scripts/dump-storage-state.ts) instead of running the
+  // automated login below, which Shopify's captcha blocks for accounts that
+  // aren't allowlisted for this suite. Not used in CI.
+  if (process.env.E2E_SKIP_GLOBAL_LOGIN) {
+    const missing = Object.values(xdgEnv).filter((dir) => !fs.existsSync(dir))
+    if (missing.length > 0) {
+      throw new Error(
+        `E2E_SKIP_GLOBAL_LOGIN is set but expected auth dirs are missing: ${missing.join(', ')}\n` +
+          `Run 'shopify auth login' manually with XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_STATE_HOME/XDG_CACHE_HOME ` +
+          `pointed at the paths above first.`,
+      )
+    }
+
+    process.env.E2E_AUTH_CONFIG_DIR = xdgEnv.XDG_CONFIG_HOME
+    process.env.E2E_AUTH_DATA_DIR = xdgEnv.XDG_DATA_HOME
+    process.env.E2E_AUTH_STATE_DIR = xdgEnv.XDG_STATE_HOME
+    process.env.E2E_AUTH_CACHE_DIR = xdgEnv.XDG_CACHE_HOME
+    if (fs.existsSync(storageStatePath)) {
+      process.env.E2E_BROWSER_STATE_PATH = storageStatePath
+    }
+    globalLog('auth', `global setup skipped — reusing manually authenticated session at ${authDir}`)
+    return
+  }
+
   // Create fresh XDG dirs
   for (const dir of Object.values(xdgEnv)) {
     fs.mkdirSync(dir, {recursive: true})
