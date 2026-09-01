@@ -98,27 +98,6 @@
     "printWidth": 120
   },
   "version": "0.0.0",
-  "pnpm": {
-    "peerDependencyRules": {
-      "allowedVersions": {
-        "@shopify/cli-hydrogen>@graphql-codegen/cli": "6.0.1",
-        "@shopify/polaris>react": "19.2.4",
-        "@shopify/polaris>react-dom": "19.2.4",
-        "react-dom>react": "18.3.1",
-        "use-resize-observer>react-dom": "19.2.4"
-      }
-    },
-    "onlyBuiltDependencies": [
-      "@parcel/watcher",
-      "esbuild",
-      "msw",
-      "node-pty",
-      "nx",
-      "protobufjs",
-      "unrs-resolver",
-      "yarn"
-    ]
-  },
   "resolutions": {
     "@types/react": "18.3.12",
     "vite": "6.4.3",
